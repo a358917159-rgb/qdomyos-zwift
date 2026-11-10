@@ -1,0 +1,173 @@
+# Zero-local-install build: produce the slim QZ Android APK in GitHub Actions.
+#
+# Put this file in .github/workflows/ of YOUR OWN fork of
+# https://github.com/cagnulein/qdomyos-zwift, and commit tools/qz-slim/
+# (apply-slim.js, verify-slim.js, henortektreadmill.h, henortektreadmill.cpp).
+# Then click Actions -> "Build UOK E6Pro slim APK" -> "Run workflow".
+#
+# NO INPUTS ON PURPOSE: the person running this has no GitHub experience and
+# uses a web translator. The dialog therefore shows only one green button.
+# To change a value, edit the three constants in `env:` below.
+# Nothing is published upstream; no Issue/PR is created.
+#
+# Parameters follow the upstream AGENTS.md "Building a debug APK" recipe and
+# src/android/build.gradle (AGP 9.1.1 -> JDK 17, compileSdk 37).
+
+name: Build UOK E6Pro slim APK
+
+on:
+  workflow_dispatch:
+
+env:
+  # 99% of modern Android phones use arm64-v8a. Do not change unless your
+  # phone is very old (armeabi-v7a) or is an emulator (x86_64).
+  ABI: 'arm64-v8a'
+  QT_VERSION: '5.15.2'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      ANDROID_COMPILE_SDK: '37'
+      ANDROID_BUILD_TOOLS: '35.0.0'
+      NDK_VERSION: '25.1.8937393'
+    steps:
+      # IMPORTANT: do NOT pin `ref:` to an older commit here. The user just
+      # committed .github/workflows/ and tools/qz-slim/ on the default branch;
+      # checking out an older revision would delete those files from the
+      # worktree and the very next step would fail with "tools/qz-slim not
+      # found". The dry-run below already protects against upstream drift.
+      - name: Checkout fork (default branch + submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Apply verified v2 driver + slim patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d tools/qz-slim || { echo "::error::commit tools/qz-slim/ into the fork first"; exit 1; }
+          # Dry run first: fail fast (and cheaply) if upstream moved an anchor.
+          echo "=== patch dry run ==="
+          node tools/qz-slim/apply-slim.js --repo . 2>&1 | tee /tmp/slim-dry.log
+          if grep -q 'ERROR' /tmp/slim-dry.log; then
+            echo "::error::slim patch anchors no longer match this QZ revision; send the log to the assistant"
+            exit 1
+          fi
+          echo "=== applying ==="
+          node tools/qz-slim/apply-slim.js --repo . --apply
+          node tools/qz-slim/verify-slim.js .
+          echo "--- slim patch applied and verified ---"
+
+      # AGENTS.md gotcha #2: translations/*.qm are untracked build artifacts.
+      # A fresh checkout has none, and qrc_translations.cpp then fails to build.
+      - name: Generate translation .qm files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ls src/translations/*.ts >/dev/null 2>&1; then
+            lrelease src/translations/*.ts
+          fi
+          echo "qm files: $(ls src/translations/*.qm 2>/dev/null | wc -l)"
+
+      - name: Install JDK 17 (AGP 9.x requirement)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Qt for Android
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: android
+          # install-qt-action maps the android target to the multi-ABI Qt build.
+          modules: qtcharts qtwebsockets qtconnectivity qtlocation qtmultimedia
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+
+      - name: Install Android platform / build-tools / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "platform-tools"
+          yes | sdkmanager --licenses >/dev/null || true
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "QT_ANDROID_DIR=$Qt5_DIR" >> "$GITHUB_ENV"
+
+      - name: qmake + single-ABI make + androiddeployqt + gradle
+        shell: bash
+        env:
+          ABI: ${{ env.ABI }}
+        run: |
+          set -euo pipefail
+          mkdir -p build && cd build
+
+          # Map ABI -> qmake submake target. AGENTS.md gotcha #1: passing
+          # ANDROID_ABIS to plain `make` is IGNORED; it rebuilds all 4 ABIs and
+          # `make install` does the same. Use the specific submake target.
+          case "$ABI" in
+            arm64-v8a)   TGT=arm64-v8a-all ;;
+            armeabi-v7a) TGT=armeabi-v7a-all ;;
+            x86_64)      TGT=x86_64-all ;;
+            x86)         TGT=x86-all ;;
+            *) echo "unknown ABI $ABI"; exit 1 ;;
+          esac
+
+          qmake ../qdomyos-zwift.pro "ANDROID_ABIS=$ABI"
+          make -j"$(nproc)" "$TGT"
+
+          # AGENTS.md gotcha #3: androiddeployqt --aux-mode can silently omit
+          # Qt runtime .so files and the QML RCC bundle. Use the normal mode.
+          SETTINGS=$(find . -name '*deployment-settings.json' | head -1)
+          test -n "$SETTINGS" || { echo "::error::no deployment-settings.json"; exit 1; }
+          androiddeployqt \
+            --input "$SETTINGS" \
+            --output "$PWD/android-build" \
+            --android-platform "android-${ANDROID_COMPILE_SDK}" \
+            --gradle --debug
+
+          cd android-build
+          ./gradlew assembleDebug
+          echo "--- APK ---"
+          find . -name '*.apk' -type f -exec ls -lh {} \;
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find build/android-build -name '*.apk' -type f -exec cp {} artifacts/ \;
+          ls -lh artifacts/
+          test -n "$(ls -A artifacts)" || { echo "::error::no APK produced"; exit 1; }
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: qz-uok-e6pro-slim-${{ env.ABI }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+# Notes / known upstream hazards (from AGENTS.md):
+#  * qrc_translations.cpp needs .qm files -> handled above with lrelease.
+#  * gradlew assembleDebug needs Java 17 -> handled by setup-java.
+#  * If the APK installs but instantly crashes with UnsatisfiedLinkError, or every
+#    QML module is "not installed", androiddeployqt omitted the Qt runtime libs /
+#    android_rcc_bundle.rcc. Reuse libs/<abi>/*.so + assets/android_rcc_bundle.rcc
+#    from a previous successful build with the SAME Qt version.
+#  * The custom message handler in main.cpp hides QML errors unless log_debug=true.
+#  * Kept BLE: FTMS 0x1826, RSC 0x1814, HR 0x180D, DIS 0x180A.
+#    Dropped: Wahoo, Echelon, Echelon Nordic DFU.
